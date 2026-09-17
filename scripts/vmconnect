@@ -1,0 +1,81 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Wire Termux to the VM over vsock, which crosses the hypervisor boundary
+# without the vendor tethering HAL (broken here) or crosvm's console input
+# (SELinux-blocked). adb speaks vsock forwarding natively.
+#
+#   guest  socat VSOCK-LISTEN:5555 -> bash on a PTY
+#          socat VSOCK-LISTEN:5556 -> sshd on 127.0.0.1:22
+#   host   adb forward tcp:8022 vsock:<CID>:5555
+set -uo pipefail
+PATH="$HOME/.local/bin:$PATH"
+STATE="$HOME/.local/share/alpinevm"
+ADB_DEV="${ADB_DEV:-127.0.0.1:$(cat "$STATE/port" 2>/dev/null || echo 5555)}"
+SHPORT=8032; SSHPORT=8033; WEBPORT=8034   # 8022 is termpanel
+A(){ adb -s "$ADB_DEV" "$@"; }
+ok(){ printf '  \033[32m✓\033[0m %s\n' "$*"; }
+no(){ printf '  \033[31m✗\033[0m %s\n' "$*"; }
+
+cid() {
+  # `vm run` reports the VM as "VmRun" regardless of the name in the config,
+  # so match on that rather than on our config's name.
+  A shell '/apex/com.android.virt/bin/vm list 2>/dev/null' 2>/dev/null \
+    | tr -d '\r' | awk '/VmRun/{f=1} f&&/cid:/{gsub(/[^0-9]/,"",$2); print $2; exit}'
+}
+
+# Multiplex over one connection: a fresh SSH handshake costs ~350ms, a
+# multiplexed one ~5ms. The socket lives for 10 minutes after last use.
+SSHOPTS=(-i "$STATE/id_vm" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+         -o LogLevel=ERROR -o ControlMaster=auto
+         -o ControlPath="$STATE/ssh-%r@%h-%p" -o ControlPersist=10m)
+
+case "${1:-setup}" in
+  setup)
+    C=$(cid)
+    [ -n "$C" ] || { no "no running alpine VM (run: vmsh start)"; exit 1; }
+    ok "VM CID = $C"
+    A shell 'grep -c VM_VSOCK_UP /data/local/tmp/i.log' >/dev/null 2>&1
+    if A shell 'grep -q VM_VSOCK_UP /data/local/tmp/i.log 2>/dev/null' 2>/dev/null; then
+      ok "guest vsock services are up"
+    else
+      no "guest never printed VM_VSOCK_UP — check: vmsh log"
+    fi
+    adb -s "$ADB_DEV" forward --remove tcp:$SHPORT  >/dev/null 2>&1
+    adb -s "$ADB_DEV" forward --remove tcp:$SSHPORT >/dev/null 2>&1
+    if adb -s "$ADB_DEV" forward tcp:$SHPORT  "vsock:$C:5555" >/dev/null 2>&1; then
+      ok "shell  -> localhost:$SHPORT"
+    else no "adb forward to vsock:$C:5555 refused"; fi
+    if adb -s "$ADB_DEV" forward tcp:$SSHPORT "vsock:$C:5556" >/dev/null 2>&1; then
+      ok "ssh    -> localhost:$SSHPORT"
+    else no "adb forward to vsock:$C:5556 refused"; fi
+    adb -s "$ADB_DEV" forward --remove tcp:$WEBPORT >/dev/null 2>&1
+    if adb -s "$ADB_DEV" forward tcp:$WEBPORT "vsock:$C:5557" >/dev/null 2>&1; then
+      ok "web    -> http://localhost:$WEBPORT"
+    else no "adb forward to vsock:$C:5557 refused"; fi
+    echo
+    echo "  browser terminal  :  vmconnect web   (http://localhost:$WEBPORT)"
+    echo "  interactive shell :  vmconnect shell"
+    echo "  ssh / scp         :  vmconnect ssh   |   vmconnect cp <src> <dst>"
+    ;;
+  web)
+    adb -s "$ADB_DEV" forward --list | grep -q "tcp:$WEBPORT" || "$0" setup >/dev/null
+    echo "opening http://localhost:$WEBPORT"
+    command -v termux-open-url >/dev/null 2>&1 && termux-open-url "http://localhost:$WEBPORT" \
+      || echo "  (open that URL in your browser)"
+    ;;
+  test)
+    printf 'echo VSOCK_SHELL_OK; uname -rm; exit\n' | timeout 15 nc 127.0.0.1 $SHPORT 2>&1 | head -10
+    ;;
+  shell)
+    command -v nc >/dev/null || { no "install netcat: pkg install netcat-openbsd"; exit 1; }
+    exec nc 127.0.0.1 $SHPORT
+    ;;
+  ssh)
+    shift
+    exec ssh "${SSHOPTS[@]}" -p $SSHPORT root@127.0.0.1 "$@"
+    ;;
+  cp)
+    shift
+    exec scp "${SSHOPTS[@]}" -P $SSHPORT "$@"
+    ;;
+  *) echo "usage: vmconnect [setup|web|test|shell|ssh|cp]" >&2; exit 1 ;;
+esac

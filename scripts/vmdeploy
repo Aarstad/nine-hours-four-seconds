@@ -1,0 +1,79 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Pair adb (if needed), push the built image, boot the VM, prove the toolchain.
+# HONOR cycles Wireless debugging often, which invalidates pairing and rotates
+# the port -- so this re-pairs on demand rather than assuming a live connection.
+set -uo pipefail
+PATH="$HOME/.local/bin:$PATH"
+IMG="$HOME/.local/share/alpinevm/rootfs.img"
+PORTFILE="$HOME/.local/share/alpinevm/port"
+b(){ printf '\033[1m%s\033[0m\n' "$*"; }
+ok(){ printf '  \033[32m✓\033[0m %s\n' "$*"; }
+no(){ printf '  \033[31m✗\033[0m %s\n' "$*"; }
+
+[ -f "$IMG" ] || { no "no image at $IMG — run vmbuild first"; exit 1; }
+
+live() { [ -n "${ADB_DEV:-}" ] && adb -s "$ADB_DEV" shell true >/dev/null 2>&1; }
+
+# try a saved port first
+if [ -f "$PORTFILE" ]; then
+  ADB_DEV="127.0.0.1:$(cat "$PORTFILE")"
+  adb connect "$ADB_DEV" >/dev/null 2>&1
+  live && ok "reconnected on $ADB_DEV"
+fi
+
+if ! live; then
+  b "adb needs pairing"
+  echo "  Settings › System › Developer options › Wireless debugging"
+  echo "  → Pair device with pairing code"
+  echo
+  read -rp "  pairing port (from the popup): " pport
+  read -rp "  6-digit code:                  " pcode
+  adb pair "127.0.0.1:${pport}" "${pcode}" >/dev/null 2>&1 || { no "pairing failed"; exit 1; }
+  ok "paired"
+  read -rp "  connection port (main screen): " cport
+  adb disconnect >/dev/null 2>&1
+  adb connect "127.0.0.1:${cport}" >/dev/null 2>&1
+  ADB_DEV="127.0.0.1:${cport}"
+  live || { no "connect failed"; exit 1; }
+  echo "$cport" > "$PORTFILE"
+  ok "connected"
+
+  # Switch adbd into persistent TCP mode on a FIXED port. Wireless debugging
+  # rotates its port every time it cycles and invalidates the pairing; plain
+  # TCP adb keeps port 5555 until reboot and needs no re-pairing, because the
+  # RSA key we already authorised still applies.
+  if adb -s "$ADB_DEV" tcpip 5555 >/dev/null 2>&1; then
+    sleep 3
+    adb disconnect >/dev/null 2>&1
+    if adb connect 127.0.0.1:5555 >/dev/null 2>&1 && \
+       adb -s 127.0.0.1:5555 shell true >/dev/null 2>&1; then
+      ADB_DEV=127.0.0.1:5555
+      echo 5555 > "$PORTFILE"
+      ok "adbd now on fixed port 5555 (survives Wireless debugging cycling)"
+    else
+      adb connect "127.0.0.1:${cport}" >/dev/null 2>&1
+    fi
+  fi
+fi
+export ADB_DEV
+
+b "Pushing image ($(du -h "$IMG" | cut -f1))"
+adb -s "$ADB_DEV" shell 'pkill -f "vm run" 2>/dev/null; true' >/dev/null 2>&1
+adb -s "$ADB_DEV" push "$IMG" /data/local/tmp/alpine.img 2>&1 | tail -1
+adb -s "$ADB_DEV" shell 'test -f /data/local/tmp/job.img || dd if=/dev/zero of=/data/local/tmp/job.img bs=1024 count=8192 2>/dev/null; true'
+
+b "Booting"
+vmsh start || exit 1
+
+b "Toolchain"
+vmsh 'for t in gcc g++ make cmake git python3 node nvim rg jq; do printf "  %-8s %s\n" "$t" "$(command -v $t || echo MISSING)"; done'
+
+b "Compiling C inside the VM"
+vmsh 'printf "%s\n" "#include <stdio.h>" "int main(void){long t=0;for(long i=1;i<=1000000;i++)t+=i;printf(\"gcc works, sum=%ld\\n\",t);return 0;}" > /tmp/h.c && gcc -O2 -o /tmp/h /tmp/h.c && /tmp/h'
+
+b "Python / Node"
+vmsh 'python3 -c "import sys;print(\"  python\", sys.version.split()[0])"; node -e "console.log(\"  node\", process.version)"'
+
+b "Wiring vsock (interactive shell + ssh)"
+vmconnect setup
+vmconnect test

@@ -1,0 +1,71 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Run a shell command inside a real Linux VM on this phone.
+#
+# The VM boots Alpine on Android's own microdroid kernel via GenieZone, using
+# only `adb` + binaries Android already ships. No root, no custom ROM.
+#
+# Interactive console input is SELinux-blocked for the shell domain, and HONOR's
+# AVF networking is broken, so jobs are delivered on a second virtio disk and
+# results come back over the serial console.
+set -uo pipefail
+ADB_DEV="${ADB_DEV:-127.0.0.1:33409}"
+WORK="$HOME/.local/share/alpinevm"
+mkdir -p "$WORK"
+A() { adb -s "$ADB_DEV" "$@"; }
+
+[ $# -ge 1 ] || { echo "usage: vmrun '<shell command>'   |   vmrun -f script.sh" >&2; exit 1; }
+
+if [ "$1" = "-f" ]; then
+  [ -f "${2:-}" ] || { echo "no such script: ${2:-}" >&2; exit 1; }
+  cp "$2" "$WORK/job.sh"
+else
+  printf '%s\n' "$*" > "$WORK/job.sh"
+fi
+
+# Build a tiny job disk (a few MB, ~0.1s to push) instead of re-pushing 400MB.
+rm -rf "$WORK/jobdir" && mkdir -p "$WORK/jobdir"
+cp "$WORK/job.sh" "$WORK/jobdir/job.sh"
+rm -f "$WORK/job.img"
+mke2fs -q -t ext4 -d "$WORK/jobdir" -b 1024 -I 256 -F "$WORK/job.img" 8M >/dev/null 2>&1 || true
+
+A push "$WORK/job.img" /data/local/tmp/job.img >/dev/null 2>&1 || { echo "adb push failed — is the device connected?" >&2; exit 1; }
+
+A shell 'cat > /data/local/tmp/vmjob.json' <<'JSON'
+{
+  "name": "alpinejob",
+  "kernel": "/apex/com.android.virt/etc/fs/microdroid_kernel",
+  "params": "console=hvc0 root=/dev/vda rw init=/init panic=5 quiet loglevel=3",
+  "disks": [
+    { "image": "/data/local/tmp/alpine.img", "writable": true },
+    { "image": "/data/local/tmp/job.img",    "writable": true }
+  ],
+  "memory_mib": 1024,
+  "cpu_topology": "one_cpu",
+  "console_input_device": "hvc0",
+  "platform_version": "~1.0",
+  "protected": false
+}
+JSON
+
+# Remove the stale log FIRST and confirm it is gone, otherwise the poll below
+# instantly matches the previous run's end marker.
+A shell 'pkill -f "vm run" 2>/dev/null; rm -f /data/local/tmp/job.log /data/local/tmp/job.out' >/dev/null 2>&1
+A shell 'cat > /data/local/tmp/runjob.sh' <<'RUNNER'
+#!/system/bin/sh
+cd /data/local/tmp
+setsid /apex/com.android.virt/bin/vm run /data/local/tmp/vmjob.json \
+  --console /data/local/tmp/job.log --debug full \
+  </dev/null >/data/local/tmp/job.out 2>&1 &
+RUNNER
+A shell 'sh /data/local/tmp/runjob.sh' >/dev/null 2>&1
+
+# Poll for the end marker rather than sleeping a fixed time.
+for _ in $(seq 1 60); do
+  sleep 1
+  if A shell 'command grep -q "===VM_HALT===" /data/local/tmp/job.log 2>/dev/null' 2>/dev/null; then break; fi
+done
+A shell 'pkill -f "vm run" 2>/dev/null; true' >/dev/null 2>&1
+
+A shell 'cat /data/local/tmp/job.log 2>/dev/null' | \
+  sed -n '/===VM_JOB_BEGIN===/,/===VM_JOB_END===/p' | \
+  sed '1d;$d' | sed 's/\r$//'

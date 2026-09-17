@@ -1,0 +1,10 @@
+# VM artefacts — rebuilt by scripts/vmbuild, never committed
+*.img
+*.log
+build/
+
+# keys and per-device state
+id_vm
+id_vm.pub
+port
+seq

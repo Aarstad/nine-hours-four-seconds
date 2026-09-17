@@ -1,0 +1,514 @@
+#!/data/data/com.termux/files/usr/bin/env python3
+"""termbrowse - browse the web inside a terminal, on a phone.
+
+Same idea as Carbonyl, different plumbing. Carbonyl is a Chromium *fork* that
+renders half-blocks from inside the compositor; building it for Android/bionic
+is a ~100GB, many-hour proposition and its prebuilt binaries are glibc-only.
+Termux ships a stock bionic Chromium, so we drive that over the DevTools
+Protocol instead:
+
+    headless Chromium --(Page.startScreencast)--> JPEG frames
+                                                      |
+                                                    chafa
+                                                      |
+                                         truecolor half-block cells
+
+Input goes back the other way as Input.dispatchKeyEvent / dispatchMouseEvent.
+"""
+from __future__ import annotations
+
+import base64, json, os, re, select, shutil, signal, subprocess, sys, termios
+import time, tty, urllib.parse, urllib.request
+from pathlib import Path
+
+try:
+    import websocket
+except ImportError:
+    sys.exit("pip install websocket-client")
+
+CDP = "127.0.0.1:9222"
+TMP = Path(os.environ.get("TMPDIR", "/data/data/com.termux/files/usr/tmp")) / "termbrowse"
+TMP.mkdir(parents=True, exist_ok=True)
+FRAME = TMP / "frame.jpg"
+PROFILE = TMP / "profile"
+
+# Chromium reports a device pixel per CSS pixel; a terminal cell is about 8x16
+# of them once chafa packs two pixel rows into one cell with half blocks.
+CELL_W, CELL_H = 8, 16
+
+# Half-block "symbols" output gives one colour per half cell, so a 50x20
+# terminal is really 50x40 pixels for the whole page -- fine for logos and
+# layout, hopeless for body text. Sixel ships real pixels and would fix that,
+# but a terminal that does not implement it prints the escape data as literal
+# text, which is spectacular and useless. Termux's terminal does NOT support
+# sixel, so "auto" probes with DA1 and falls back to half blocks.
+FORMAT = os.environ.get("TERMBROWSE_FORMAT", "auto")
+ZOOM = float(os.environ.get("TERMBROWSE_ZOOM", "1"))
+
+# Sub-cell grid for each symbol set: how many pixels one character carries.
+SUBCELL = {"half": (1, 2), "quad": (2, 2), "sextant": (2, 3), "octant": (2, 4)}
+
+# How finely one character cell is subdivided. Each step multiplies effective
+# resolution for roughly 10% more render time -- the limit is whether the
+# terminal FONT actually has the glyphs:
+#   half     1x2 = 2 px/cell   universally available
+#   quad     2x2 = 4 px/cell   Unicode 1.1 block elements, very safe
+#   sextant  2x3 = 6 px/cell   Unicode 13 (2020) -- NOT in Termux's font
+#   octant   2x4 = 8 px/cell   Unicode 16 (2024), rarely present yet
+# If the page renders as rows of tofu boxes, drop back a level.
+def best_symbols() -> str:
+    """Pick the finest subdivision the terminal FONT can actually draw.
+
+    Getting this wrong is not subtle: a font without the glyphs renders every
+    cell as a tofu box. Termux's bundled font stops at quad blocks (Unicode
+    1.1); sextants are Unicode 13 and octants Unicode 16, so probe ~/.termux/
+    font.ttf and cache the answer.
+    """
+    cache = Path.home() / ".cache" / "termbrowse-symbols"
+    font = Path.home() / ".termux" / "font.ttf"
+    try:
+        if cache.exists() and font.exists() and \
+                cache.stat().st_mtime >= font.stat().st_mtime:
+            return cache.read_text().strip()
+    except OSError:
+        pass
+    pick = "quad"
+    try:
+        from fontTools.ttLib import TTFont
+        cm = set()
+        for t in TTFont(str(font), fontNumber=0)["cmap"].tables:
+            cm |= set(t.cmap.keys())
+        if all(c in cm for c in range(0x1CEA0, 0x1CEC0)):
+            pick = "octant"
+        elif all(c in cm for c in range(0x1FB00, 0x1FB3C)):
+            pick = "sextant"
+    except Exception:
+        pick = "quad"          # no font override, or no fontTools: play safe
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(pick)
+    except OSError:
+        pass
+    return pick
+
+
+SYMBOLS = os.environ.get("TERMBROWSE_SYMBOLS") or best_symbols()
+
+VK = {  # terminal escape -> (key name, windows virtual key code)
+    "\x1b[A": ("ArrowUp", 38),    "\x1b[B": ("ArrowDown", 40),
+    "\x1b[C": ("ArrowRight", 39), "\x1b[D": ("ArrowLeft", 37),
+    "\x1b[H": ("Home", 36),       "\x1b[F": ("End", 35),
+    "\x1b[5~": ("PageUp", 33),    "\x1b[6~": ("PageDown", 34),
+    "\x1b[3~": ("Delete", 46),
+    "\r": ("Enter", 13), "\n": ("Enter", 13),
+    "\x7f": ("Backspace", 8), "\x08": ("Backspace", 8),
+    "\t": ("Tab", 9),
+}
+MOUSE_RE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+
+
+def ensure_chromium(width_px: int, height_px: int) -> None:
+    """Start headless Chromium with CDP if it is not already listening."""
+    try:
+        urllib.request.urlopen(f"http://{CDP}/json/version", timeout=1).read()
+        return
+    except Exception:
+        pass
+    PROFILE.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(
+        ["chromium-browser", "--headless", "--disable-gpu", "--no-sandbox",
+         "--remote-debugging-port=9222", "--remote-allow-origins=*",
+         "--hide-scrollbars", "--mute-audio", "--disable-dev-shm-usage",
+         f"--window-size={width_px},{height_px}",
+         f"--user-data-dir={PROFILE}", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env={**os.environ, "http_proxy": "", "https_proxy": "",
+             "HTTP_PROXY": "", "HTTPS_PROXY": ""})
+    for _ in range(60):
+        time.sleep(0.5)
+        try:
+            urllib.request.urlopen(f"http://{CDP}/json/version", timeout=1).read()
+            return
+        except Exception:
+            continue
+    sys.exit("chromium did not come up on :9222 — see `chromium-browser --version`")
+
+
+def page_ws() -> str:
+    with urllib.request.urlopen(f"http://{CDP}/json", timeout=5) as r:
+        for t in json.load(r):
+            if t["type"] == "page":
+                return t["webSocketDebuggerUrl"]
+    sys.exit("no page target in CDP")
+
+
+class Browser:
+    def __init__(self, cols: int, rows: int):
+        self.ws = websocket.create_connection(page_ws(), suppress_origin=True,
+                                              timeout=30)
+        self.n = 0
+        self.url = ""
+        self.title = ""
+        self.loading = False
+        self.frames = 0
+        self.resize(cols, rows)
+        self.send("Page.enable")
+
+    # ---- protocol -------------------------------------------------------
+    def send(self, method: str, params: dict | None = None) -> int:
+        self.n += 1
+        self.ws.send(json.dumps({"id": self.n, "method": method,
+                                 "params": params or {}}))
+        return self.n
+
+    def resize(self, cols: int, rows: int) -> None:
+        self.cols, self.rows = cols, rows
+        # The old sizing rendered a cols*8 wide page and then threw away 3/4
+        # of it. Size the viewport to the number of sub-pixels we can actually
+        # draw, so one CSS pixel lands on one rendered pixel and text keeps its
+        # shape. ZOOM > 1 trades visible page area for bigger text.
+        sx, sy = SUBCELL.get(SYMBOLS, (2, 2))
+        # No generous minimums: they forced a fixed aspect, chafa letterboxed
+        # to fit, and clicks near the bottom landed outside the drawn area.
+        self.px = max(120, int(cols * sx / ZOOM))
+        self.py = max(80, int(rows * sy / ZOOM))
+        # CSS pixels per character cell, derived from the viewport we actually
+        # asked for. Input MUST use this, not a fixed 8x16 -- otherwise taps
+        # land several times too far right and down, which is exactly what
+        # happens once the viewport is sized to sub-pixels.
+        self.cx = self.px / max(cols, 1)
+        self.cy = self.py / max(rows, 1)
+        self.send("Emulation.setDeviceMetricsOverride",
+                  {"width": self.px, "height": self.py,
+                   "deviceScaleFactor": 1, "mobile": False})
+
+    def navigate(self, url: str) -> None:
+        if not re.match(r"^[a-z]+:", url):
+            url = ("https://duckduckgo.com/?q=" + urllib.parse.quote(url)
+                   if (" " in url or "." not in url) else "https://" + url)
+        self.loading = True
+        self.send("Page.navigate", {"url": url})
+
+    def screencast(self, on: bool) -> None:
+        if on:
+            self.send("Page.startScreencast",
+                      {"format": "jpeg", "quality": 60,
+                       "maxWidth": self.px, "maxHeight": self.py,
+                       "everyNthFrame": 1})
+        else:
+            self.send("Page.stopScreencast")
+
+    # ---- input ----------------------------------------------------------
+    def type_char(self, ch: str) -> None:
+        self.send("Input.dispatchKeyEvent",
+                  {"type": "char", "text": ch, "unmodifiedText": ch,
+                   "key": ch})
+
+    def special(self, key: str, vk: int) -> None:
+        for phase in ("rawKeyDown", "keyUp"):
+            self.send("Input.dispatchKeyEvent",
+                      {"type": phase, "key": key,
+                       "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+
+    def mouse_px(self, kind: str, x: int, y: int, button: str = "left",
+                 clicks: int = 1) -> None:
+        self.send("Input.dispatchMouseEvent",
+                  {"type": kind, "x": x, "y": y, "button": button,
+                   "clickCount": clicks,
+                   "buttons": 1 if kind == "mousePressed" else 0})
+
+    def wheel_px(self, x: int, y: int, dy: int) -> None:
+        self.send("Input.dispatchMouseEvent",
+                  {"type": "mouseWheel", "x": x, "y": y,
+                   "deltaX": 0, "deltaY": dy})
+
+    def mouse(self, kind: str, col: int, row: int, button: str = "left",
+              clicks: int = 1) -> None:
+        x = int(col * self.cx + self.cx / 2)
+        y = int(row * self.cy + self.cy / 2)
+        self.send("Input.dispatchMouseEvent",
+                  {"type": kind, "x": x, "y": y, "button": button,
+                   "clickCount": clicks, "buttons": 1 if kind == "mousePressed" else 0})
+
+    def wheel(self, col: int, row: int, dy: int) -> None:
+        self.send("Input.dispatchMouseEvent",
+                  {"type": "mouseWheel", "x": int(col * self.cx),
+                   "y": int(row * self.cy), "deltaX": 0, "deltaY": dy})
+
+    def eval_js(self, expr: str) -> None:
+        self.send("Runtime.evaluate", {"expression": expr})
+
+
+def detect_format() -> str:
+    """Ask the terminal for its Primary Device Attributes; ';4' means sixel."""
+    if FORMAT != "auto":
+        return FORMAT
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return "symbols"
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        os.write(fd, b"\x1b[c")
+        r, _, _ = select.select([fd], [], [], 0.4)
+        resp = os.read(fd, 256) if r else b""
+    except OSError:
+        resp = b""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        os.close(fd)
+    # A sixel-capable terminal reports ";4" among its DA1 attributes.
+    return "sixels" if (b";4;" in resp or b";4c" in resp) else "symbols"
+
+
+def render(path: Path, cols: int, rows: int, fmt: str = "symbols") -> str:
+    # stdin=DEVNULL and a detached /dev/tty matter enormously here: chafa probes
+    # the terminal with OSC colour queries and blocks ~5s waiting for a reply,
+    # because our parent owns the pty and never answers. That turned a 70ms
+    # render into a 5-second one. Denying it a tty makes the query fail fast.
+    fmt = {"sixel": "sixels", "sixels": "sixels",
+           "kitty": "kitty", "iterm": "iterm"}.get(fmt, "symbols")
+    args = ["chafa", "-f", fmt, "-c", "full", "--size", f"{cols}x{rows}",
+            "--stretch", "--animate", "off", "-O", "0", "--relative", "off",
+            "--fg", "FFFFFF", "--bg", "000000", "--polite", "on"]
+    if fmt == "symbols":
+        args[3:3] = ["--symbols", SYMBOLS]
+    r = subprocess.run(
+        args + [str(path)],
+        capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+        env={**os.environ, "TERM": "xterm-256color"})
+    return r.stdout
+
+
+FMT = "symbols"
+STATS = {"render": 0, "paint": 0, "frame": 0, "timeout": 0, "key": 0}
+LOG = open(os.environ["TERMBROWSE_LOG"], "w", buffering=1) if os.environ.get("TERMBROWSE_LOG") else None
+def log(*a):
+    if LOG: LOG.write(" ".join(map(str, a)) + "\n")
+
+HELP = ("ctrl-o url  ctrl-r reload  ctrl-h back  ctrl-l fwd  "
+        "arrows/pgup scroll  tap to click  ctrl-q quit")
+
+
+def main() -> None:
+    start_url = sys.argv[1] if len(sys.argv) > 1 else "https://lite.duckduckgo.com/lite/"
+    cols, rows = shutil.get_terminal_size((80, 24))
+    view_rows = rows - 1                       # keep a row for the status bar
+
+    global FMT
+    FMT = detect_format()
+    ensure_chromium(cols * CELL_W, view_rows * CELL_H)
+    b = Browser(cols, view_rows)
+    b.navigate(start_url)
+    b.screencast(True)
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    out = sys.stdout
+    out.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")   # alt screen, hide cursor, SGR mouse
+    out.flush()
+    tty.setraw(fd)
+
+    # Pinch-zooming Termux changes the cell grid. Without SIGWINCH handling the
+    # old geometry keeps being painted over the new one, which stacks partial
+    # frames and duplicate status bars on top of each other.
+    resized = [False]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+
+    prompt: str | None = None      # non-None while typing a URL
+    last_art = ""
+    art_dim = [0, 0]      # actual (cols, rows) chafa produced
+    fitted = [False]      # have we matched the viewport to the art yet?
+    last_draw = 0.0
+    fps_t, fps_n, fps = time.time(), 0, 0.0
+    running = True
+    pending = b""
+
+    def status() -> str:
+        if prompt is not None:
+            line = f" url> {prompt}"
+        else:
+            t = (b.title or b.url or "")[:cols - 26]
+            line = f" {t}  ·  {fps:.0f}fps {SYMBOLS[:4]}  ·  ctrl-o url  ctrl-q quit"
+        return ("\033[%d;1H\033[7m%-*s\033[0m" % (rows, cols, line[:cols]))
+
+    def draw(force: bool = False) -> None:
+        nonlocal last_art, last_draw, fps, fps_t, fps_n, cols, rows, view_rows
+        now = time.time()
+        if not force and now - last_draw < 0.05:
+            return
+        last_draw = now
+        t_r = time.time()
+        art = render(FRAME, cols, view_rows, FMT) if FRAME.exists() else ""
+        log(f"draw frames={STATS['frame']} timeouts={STATS['timeout']} "
+            f"chafa={int((time.time()-t_r)*1000)}ms art={len(art)} same={art==last_art}")
+        STATS["render"] += 1
+        if art and art != last_art:
+            STATS["paint"] += 1
+            if FMT == "symbols":
+                plain = [re.sub(r"\x1b\[[0-9;]*m", "", ln)
+                         for ln in art.split("\n") if ln]
+                art_dim[0] = max((len(ln) for ln in plain), default=0)
+                art_dim[1] = len(plain)
+                # The terminal is in RAW mode, so ONLCR is off and a bare "\n"
+                # moves the cursor DOWN without returning to column 0. Writing
+                # chafa's newline-separated rows straight out leaves each row
+                # starting where the previous one ended, which wraps and shows
+                # up as alternating bands across the screen. Position every row
+                # explicitly instead -- which also lets us skip unchanged rows.
+                new_rows = art.split("\n")
+                old_rows = last_art.split("\n") if last_art else []
+                buf = []
+                for i, row in enumerate(new_rows[:view_rows]):
+                    if i < len(old_rows) and old_rows[i] == row:
+                        continue
+                    buf.append("\033[%d;1H\033[0m%s" % (i + 1, row))
+                out.write("".join(buf))
+            else:
+                out.write("\033[H" + art)
+            last_art = art
+        out.write(status())
+        out.flush()
+        fps_n += 1
+        if now - fps_t >= 1.0:
+            fps, fps_n, fps_t = fps_n / (now - fps_t), 0, now
+
+    def to_page(col: int, row: int) -> tuple[int, int]:
+        """Terminal cell -> CSS pixel. --stretch means the art fills the grid,
+        so this is a straight proportional map with no letterbox offset."""
+        aw = art_dim[0] or cols
+        ah = art_dim[1] or view_rows
+        fx = b.px / max(aw, 1)
+        fy = b.py / max(ah, 1)
+        x = min(max(int(col * fx + fx / 2), 0), b.px - 1)
+        y = min(max(int(row * fy + fy / 2), 0), b.py - 1)
+        return x, y
+
+    def handle_key(data: bytes) -> None:
+        nonlocal running, prompt, cols, rows, view_rows
+        s = data.decode("utf-8", "ignore")
+
+        # ---- mouse first: SGR sequences are unambiguous ----
+        for m in MOUSE_RE.finditer(s):
+            btn, x, y, updown = int(m.group(1)), int(m.group(2)) - 1, int(m.group(3)) - 1, m.group(4)
+            px_, py_ = to_page(x, y)
+            if btn == 64:   b.wheel_px(px_, py_, -120); continue
+            if btn == 65:   b.wheel_px(px_, py_,  120); continue
+            if btn == 0:
+                if updown == "M":
+                    b.mouse_px("mousePressed", px_, py_)
+                else:
+                    b.mouse_px("mouseReleased", px_, py_)
+                    draw(force=True)
+        s = MOUSE_RE.sub("", s)
+        if not s:
+            return
+
+        if prompt is not None:                      # URL entry mode
+            if s in ("\r", "\n"):
+                b.navigate(prompt.strip()); prompt = None
+            elif s in ("\x7f", "\x08"):
+                prompt = prompt[:-1]
+            elif s == "\x1b":
+                prompt = None
+            else:
+                prompt += "".join(c for c in s if c.isprintable())
+            draw(force=True)
+            return
+
+        if s == "\x11":  running = False; return                 # ctrl-q
+        if s == "\x0f":  prompt = ""; draw(force=True); return    # ctrl-o
+        if s == "\x12":  b.send("Page.reload"); return            # ctrl-r
+        if s == "\x08" or s == "\x1b[1;3D":
+            b.eval_js("history.back()"); return                   # ctrl-h
+        if s == "\x0c":  b.eval_js("history.forward()"); return   # ctrl-l
+
+        if s in VK:
+            key, vk = VK[s]
+            if key in ("ArrowUp", "ArrowDown", "PageUp", "PageDown"):
+                step = 120 if key in ("ArrowUp", "ArrowDown") else view_rows * CELL_H
+                b.wheel_px(b.px // 2, b.py // 2,
+                           -step if key in ("ArrowUp", "PageUp") else step)
+            else:
+                b.special(key, vk)
+            return
+        for ch in s:
+            if ch.isprintable():
+                b.type_char(ch)
+
+    try:
+        # Do NOT select() on b.ws.sock: websocket-client buffers whole frames
+        # internally, so a frame already in its buffer never shows the raw
+        # socket as readable and the stream silently stalls. Poll recv() with a
+        # short timeout instead, and check stdin without blocking.
+        b.ws.settimeout(0.02)
+        while running:
+            if resized[0]:
+                resized[0] = False
+                cols, rows = shutil.get_terminal_size((80, 24))
+                view_rows = rows - 1
+                b.resize(cols, view_rows)
+                fitted[0] = False
+                b.screencast(False)
+                b.screencast(True)
+                last_art = ""                    # force a full repaint
+                out.write("\033[2J")
+                out.flush()
+            r, _, _ = select.select([fd], [], [], 0)
+            if r:
+                handle_key(os.read(fd, 4096))
+                continue
+            try:
+                msg = b.ws.recv()
+            except websocket.WebSocketTimeoutException:
+                STATS['timeout'] += 1
+                draw()
+                continue
+            except (OSError, websocket.WebSocketConnectionClosedException):
+                break
+            if not msg:
+                continue
+            try:
+                ev = json.loads(msg)
+            except ValueError:
+                continue
+            m = ev.get("method")
+            if m == "Page.screencastFrame":
+                p = ev["params"]
+                FRAME.write_bytes(base64.b64decode(p["data"]))
+                # Ack immediately or Chromium stops sending frames.
+                b.send("Page.screencastFrameAck", {"sessionId": p["sessionId"]})
+                b.frames += 1
+                STATS['frame'] += 1
+                draw()
+            elif m == "Page.frameNavigated":
+                fr = ev["params"].get("frame", {})
+                if not fr.get("parentId"):
+                    b.url = fr.get("url", "")
+                    b.title = ""
+            elif m == "Page.loadEventFired":
+                b.loading = False
+                b.send("Runtime.evaluate", {"expression": "document.title"})
+            elif "result" in ev:
+                rv = ev["result"].get("result", {})
+                if rv.get("type") == "string" and rv.get("value"):
+                    b.title = rv["value"]
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        out.write("\033[?1006l\033[?1000l\033[?25h\033[?1049l\033[0m\n")
+        out.flush()
+        print(f"{b.frames} frames · {STATS['paint']} repaints · {b.url}")
+        if os.environ.get("TERMBROWSE_KEEP") != "1":
+            subprocess.run(["pkill", "-x", "chromium-browser"],
+                           capture_output=True)
+        else:
+            print("chromium left running on :9222 (TERMBROWSE_KEEP=1)")
+
+
+if __name__ == "__main__":
+    main()

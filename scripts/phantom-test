@@ -1,0 +1,40 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Empirically check whether Android's phantom-process killer is still active.
+#
+# The `settings get` command is privileged, so Termux cannot simply read the
+# flag. Instead we spawn more child processes than the ~32 limit and count
+# survivors. If the killer is off, all of them live.
+#
+# Safe by design: children are plain `sleep`, spawned in one burst and reaped
+# immediately. It does NOT emulate a heavy build.
+set -uo pipefail
+N="${1:-48}"
+
+echo "Spawning $N child processes (phantom limit is ~32)…"
+pids=()
+for _ in $(seq 1 "$N"); do
+  sleep 20 &
+  pids+=($!)
+done
+
+sleep 6
+
+alive=0
+for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=$((alive+1)); done
+for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
+wait 2>/dev/null
+
+echo
+echo "  spawned:  $N"
+echo "  survived: $alive"
+echo
+if [ "$alive" -ge "$N" ]; then
+  echo "  ✓ All survived — phantom process killer appears DISABLED."
+  echo "    Parallel builds should be safe."
+elif [ "$alive" -le 34 ]; then
+  echo "  ✗ Capped near ~32 — the killer is still ACTIVE."
+  echo "    Enable Developer options › 'Disable child process restrictions'."
+else
+  echo "  ~ Partial ($alive/$N). Inconclusive; rerun, or something else"
+  echo "    (HONOR battery manager) is reaping processes."
+fi

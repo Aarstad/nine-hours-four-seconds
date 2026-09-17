@@ -1,0 +1,80 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Live shell into a Linux VM running on this unrooted phone.
+#
+# Interactive console input is SELinux-blocked and AVF networking is broken on
+# this device, so commands ride a raw disk that host and guest both hold an fd
+# to. crosvm never replaces the file, so writes are mutually visible.
+#
+#   offset 0      request   "SEQ<n>\n<command>"   (64 KiB)
+#   offset 65536  response  "DONE<n>\n<output>"   (rest)
+set -uo pipefail
+ADB_DEV="${ADB_DEV:-127.0.0.1:33409}"
+STATE="$HOME/.local/share/alpinevm"
+SEQF="$STATE/seq"
+mkdir -p "$STATE"
+A() { adb -s "$ADB_DEV" "$@"; }
+T=/data/local/tmp
+
+# NOTE: `command grep` -- Claude Code's grep shim is broken in this Termux env
+# and made this return false at random, silently rebooting the VM mid-session.
+running() {
+  local n
+  n=$(A shell 'ps -A 2>/dev/null | grep -c crosvm' 2>/dev/null | tr -dc '0-9')
+  [ -n "$n" ] && [ "$n" -gt 0 ]
+}
+
+start() {
+  A shell "dd if=/dev/zero of=$T/ctl.img bs=1024 count=2048 2>/dev/null; sh $T/runi.sh" >/dev/null 2>&1
+  for _ in $(seq 1 40); do
+    sleep 1
+    if A shell "grep -q VM_CHANNEL_UP $T/i.log 2>/dev/null" 2>/dev/null; then
+      echo 0 > "$SEQF"; echo "VM up."; return 0
+    fi
+  done
+  echo "VM failed to come up; see: vmsh log" >&2; return 1
+}
+
+run() {
+  [ -f "$SEQF" ] || echo 0 > "$SEQF"
+  local n; n=$(( $(cat "$SEQF") + 1 )); echo "$n" > "$SEQF"
+
+  # Two-phase write: BODY first at 1 KiB, HEADER last at sector 0. The guest
+  # only acts once it sees a new header, so it can never read a torn command.
+  printf '%s\n__EOC__\n' "$*" > "$STATE/body.bin"
+  printf 'SEQ%s\n'         "$n" > "$STATE/hdr.bin"
+  A push "$STATE/body.bin" "$T/body.bin" >/dev/null 2>&1
+  A push "$STATE/hdr.bin"  "$T/hdr.bin"  >/dev/null 2>&1
+  # conv=notrunc: write in place so crosvm's already-open fd sees it.
+  A shell "dd if=$T/body.bin of=$T/ctl.img bs=1024 seek=1 conv=notrunc 2>/dev/null
+           sync
+           dd if=$T/hdr.bin  of=$T/ctl.img bs=1024 seek=0 conv=notrunc 2>/dev/null
+           sync" >/dev/null 2>&1
+
+  local out
+  for _ in $(seq 1 120); do
+    out=$(A shell "dd if=$T/ctl.img bs=1024 skip=64 count=940 2>/dev/null | tr -d '\000'" 2>/dev/null)
+    if printf '%s' "$out" | head -1 | command grep -q "^DONE$n"; then
+      printf '%s' "$out" | tail -n +2 | sed 's/\r$//' | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}'
+      echo
+      return 0
+    fi
+    sleep 0.4
+  done
+  echo "timeout waiting for the VM (seq $n)" >&2; return 1
+}
+
+case "${1:-}" in
+  start)  start ;;
+  stop)   A shell 'pkill -f "vm run"' >/dev/null 2>&1; echo "stopped" ;;
+  status) running && echo "running" || echo "not running" ;;
+  log)    A shell "tail -40 $T/i.log" ;;
+  repl)
+    running || start || exit 1
+    echo "VM shell. State persists between commands. Ctrl-D to exit."
+    while IFS= read -r -p $'\033[1;32mvm\033[0m $ ' line; do
+      [ -z "$line" ] && continue
+      run "$line"
+    done ;;
+  "")     echo "usage: vmsh start|stop|status|log|repl | vmsh '<command>'" >&2; exit 1 ;;
+  *)      running || start >/dev/null || exit 1; run "$@" ;;
+esac
