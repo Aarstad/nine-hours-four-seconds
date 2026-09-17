@@ -25,8 +25,8 @@ you about the nine hours.
 Android 16 ships a Linux Terminal — an actual Debian virtual machine running
 under the Android Virtualization Framework. Every article I could find said the
 same two things: Pixel devices only, and Samsung never. My phone is a HONOR 600
-Lite, which is a mid-range MediaTek handset I bought specifically because I did
-not care what happened to it.
+Lite, a mid-range MediaTek handset I bought precisely because it was cheap
+enough to experiment on.
 
 So naturally I checked. And there it was:
 
@@ -58,9 +58,9 @@ E Tethering: addDownstream(avf_tap_fixed, 10.194.2.0/24) failed:
 
 Here is the thing about that error. The hypervisor worked. crosvm worked. The VM
 booted. What didn't work were two vendor HALs — the display backend and the
-network tap — which someone at HONOR had simply never wired up, presumably
-because the feature was never meant to be visible and nobody was going to file a
-bug about a menu entry that doesn't exist.
+network tap — which were never wired up on this device. That is what you would
+expect of a feature shipped switched off, with its Developer Options entry
+removed: nothing downstream of the menu was ever exercised.
 
 There's an in-app "Recovery" button. It is the saddest button I have ever
 pressed. It restarts the VM, which boots, which asks for a display, which isn't
