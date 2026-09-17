@@ -1,4 +1,4 @@
-# Linux VMs on half-shipped Android devices
+# Linux VMs on Android devices that shipped the hypervisor and hid the app
 
 Tooling from an evening spent booting Alpine Linux inside a hardware VM on an
 **unrooted, bootloader-locked, mid-range MediaTek phone** — using only binaries
@@ -55,7 +55,7 @@ network, so everything is installed before the image is sealed.
 | `guest-init.sh` | the guest's `/init` — all the device-node and service setup |
 | `phantom-test` | measure whether Android's phantom-process killer is actually on |
 
-## The five things that will bite you
+## The five things that caught me out
 
 **1. The microdroid kernel has no devtmpfs.** The guest sees an empty `/dev`
 even though the kernel enumerated every disk, and root still mounts because
@@ -97,14 +97,14 @@ ssh/scp/sftp, a browser terminal, and a full toolchain (gcc, Python, Node).
 
 Blocked, on this device: guest networking (vendor tethering HAL rejects
 `avf_tap_fixed`), crosvm console input (SELinux), and any display backend. The
-stock Terminal app cannot be fixed — its VM config lives in a private data
-directory and no display knob is exposed.
+stock Terminal app stays out of reach — its VM config lives in a private data
+directory, with no display knob exposed. Nothing here needs it.
 
 ## Should you use this?
 
-Probably not, for daily work. [Termux](https://termux.dev) is better at almost
-everything on a phone: Android API access, instant startup, no adb, a package
-repository you can reach from inside it.
+For daily work, [Termux](https://termux.dev) is the happier home, and better at
+almost everything on a phone: Android API access, instant startup, no adb, a
+package repository you can reach from inside it.
 
 The VM earns its place in three cases: running binaries that assume Linux rather
 than bionic, wanting something disposable you can rebuild in thirty seconds, and
