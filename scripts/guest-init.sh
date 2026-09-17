@@ -51,8 +51,8 @@ if mount -t ext4 /dev/vdb /mnt/job 2>/dev/null; then
 fi
 
 # vsock services. vsock crosses the hypervisor boundary directly, so it needs
-# neither the vendor tethering HAL nor crosvm's console input -- the two things
-# that are broken on this class of device.
+# neither the vendor tethering HAL nor crosvm's console input -- the two paths
+# that are unavailable on this class of device.
 #   host: adb forward tcp:8032 vsock:<CID>:5555
 if [ -c /dev/vsock ]; then
   socat VSOCK-LISTEN:5555,fork,reuseaddr \

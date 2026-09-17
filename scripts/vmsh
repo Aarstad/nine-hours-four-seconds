@@ -1,8 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Live shell into a Linux VM running on this unrooted phone.
 #
-# Interactive console input is SELinux-blocked and AVF networking is broken on
-# this device, so commands ride a raw disk that host and guest both hold an fd
+# Interactive console input is SELinux-blocked and AVF networking never comes up
+# on this device, so commands ride a raw disk that host and guest both hold an fd
 # to. crosvm never replaces the file, so writes are mutually visible.
 #
 #   offset 0      request   "SEQ<n>\n<command>"   (64 KiB)
@@ -15,8 +15,9 @@ mkdir -p "$STATE"
 A() { adb -s "$ADB_DEV" "$@"; }
 T=/data/local/tmp
 
-# NOTE: `command grep` -- Claude Code's grep shim is broken in this Termux env
-# and made this return false at random, silently rebooting the VM mid-session.
+# NOTE: `command grep` throughout. A grep on PATH that is not GNU grep -- Claude
+# Code's session shim routes to a bundled ugrep with its own defaults -- made this
+# return false at random, which silently rebooted the VM mid-session.
 running() {
   local n
   n=$(A shell 'ps -A 2>/dev/null | grep -c crosvm' 2>/dev/null | tr -dc '0-9')

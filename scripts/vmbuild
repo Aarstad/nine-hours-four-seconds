@@ -1,8 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Build a provisioned Alpine rootfs image for the phone VM.
 #
-# The guest has no network (vendor tethering HAL is broken), so every package
-# must be installed here, on the Termux side, before the image is sealed.
+# The guest has no network -- the vendor tethering HAL rejects the VM's tap
+# interface -- so every package must be installed here, on the Termux side,
+# before the image is sealed.
 # proot gives apk a believable chroot without root.
 set -uo pipefail
 

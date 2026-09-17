@@ -4,9 +4,10 @@
 # The VM boots Alpine on Android's own microdroid kernel via GenieZone, using
 # only `adb` + binaries Android already ships. No root, no custom ROM.
 #
-# Interactive console input is SELinux-blocked for the shell domain, and HONOR's
-# AVF networking is broken, so jobs are delivered on a second virtio disk and
-# results come back over the serial console.
+# Interactive console input is SELinux-blocked for the shell domain, and AVF
+# networking never comes up on this device (the tethering HAL rejects the tap),
+# so jobs are delivered on a second virtio disk and results come back over the
+# serial console.
 set -uo pipefail
 ADB_DEV="${ADB_DEV:-127.0.0.1:33409}"
 WORK="$HOME/.local/share/alpinevm"

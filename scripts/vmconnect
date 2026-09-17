@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Wire Termux to the VM over vsock, which crosses the hypervisor boundary
-# without the vendor tethering HAL (broken here) or crosvm's console input
-# (SELinux-blocked). adb speaks vsock forwarding natively.
+# without the vendor tethering HAL (which rejects the VM's tap here) or crosvm's
+# console input (SELinux-blocked). adb speaks vsock forwarding natively.
 #
 #   guest  socat VSOCK-LISTEN:5555 -> bash on a PTY
 #          socat VSOCK-LISTEN:5556 -> sshd on 127.0.0.1:22
